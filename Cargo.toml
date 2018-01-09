@@ -37,3 +37,11 @@ serde = "1.0"
 serde_derive = "1.0"
 serde_json = "1.0"
 time = "0.1"
+
+[profile.release]
+debug = 1
+[profile.bench]
+debug = 1
+
+# [patch.crates-io]
+# futures = { git = 'https://github.com/alexcrichton/futures-rs', branch = 'tokio-reform' }

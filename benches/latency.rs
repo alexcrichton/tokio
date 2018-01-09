@@ -2,7 +2,6 @@
 
 extern crate test;
 extern crate futures;
-#[macro_use]
 extern crate tokio;
 #[macro_use]
 extern crate tokio_io;
@@ -11,12 +10,13 @@ use std::io;
 use std::net::SocketAddr;
 use std::thread;
 
-use futures::sync::oneshot;
+use futures::future;
+use futures::prelude::*;
+use futures::stream;
 use futures::sync::mpsc;
-use futures::{Future, Poll, Sink, Stream};
+use futures::sync::oneshot;
 use test::Bencher;
 use tokio::net::UdpSocket;
-use tokio::reactor::Reactor;
 
 /// UDP echo server
 struct EchoServer {
@@ -59,22 +59,19 @@ fn udp_echo_latency(b: &mut Bencher) {
     let (tx, rx) = oneshot::channel();
 
     let child = thread::spawn(move || {
-        let mut l = Reactor::new().unwrap();
-        let handle = l.handle();
-
-        let socket = tokio::net::UdpSocket::bind(&any_addr, &handle).unwrap();
-        tx.complete(socket.local_addr().unwrap());
+        let socket = tokio::net::UdpSocket::bind(&any_addr).unwrap();
+        tx.send(socket.local_addr().unwrap()).unwrap();
 
         let server = EchoServer::new(socket);
         let server = server.select(stop_p.map_err(|_| panic!()));
         let server = server.map_err(|_| ());
-        l.run(server).unwrap()
+        future::blocking(server).wait().unwrap()
     });
 
 
     let client = std::net::UdpSocket::bind(&any_addr).unwrap();
 
-    let server_addr = rx.wait().unwrap();
+    let server_addr = future::blocking(rx).wait().unwrap();
     let mut buf = [0u8; 1000];
 
     // warmup phase; for some reason initial couple of
@@ -91,7 +88,7 @@ fn udp_echo_latency(b: &mut Bencher) {
         let _ = client.recv_from(&mut buf).unwrap();
     });
 
-    stop_c.complete(());
+    stop_c.send(()).unwrap();
     child.join().unwrap();
 }
 
@@ -100,8 +97,10 @@ fn futures_channel_latency(b: &mut Bencher) {
     let (mut in_tx, in_rx) = mpsc::channel(32);
     let (out_tx, out_rx) = mpsc::channel::<_>(32);
 
-    let child = thread::spawn(|| out_tx.send_all(in_rx.then(|r| r.unwrap())).wait());
-    let mut rx_iter = out_rx.wait();
+    let child = thread::spawn(|| {
+        future::blocking(out_tx.send_all(in_rx.then(|r| r.unwrap()))).wait()
+    });
+    let mut rx_iter = stream::blocking(out_rx);
 
     // warmup phase; for some reason initial couple of runs are much slower
     //

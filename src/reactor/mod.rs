@@ -20,6 +20,7 @@
 //! [`PollEvented`]: struct.PollEvented.html
 //! [`TcpStream`]: ../net/struct.TcpStream.html
 
+use std::cell::RefCell;
 use std::fmt;
 use std::io::{self, ErrorKind};
 use std::mem;
@@ -355,10 +356,33 @@ impl Handle {
     fn inner(&self) -> Option<Arc<Inner>> {
         self.inner.upgrade()
     }
+
+    // /// dox
+    // pub fn set_default_for(&self, e: &::futures::executor::Enter) {
+    //     THREAD_DEFAULT.with(|slot| {
+    //         let mut slot = slot.borrow_mut();
+    //         if slot.is_some() {
+    //             panic!("cannot do it twice")
+    //         } else {
+    //             *slot = Some(self.clone());
+    //         }
+    //     });
+    //     e.on_exit(|| {
+    //         THREAD_DEFAULT.with(|c| {
+    //             *c.borrow_mut() = None;
+    //         })
+    //     });
+    // }
 }
+
+thread_local!(static THREAD_DEFAULT: RefCell<Option<Handle>> = RefCell::new(None));
 
 impl Default for Handle {
     fn default() -> Handle {
+        if let Some(handle) = THREAD_DEFAULT.with(|c| c.borrow().clone()) {
+            return handle
+        }
+
         let mut fallback = HANDLE_FALLBACK.load(SeqCst);
 
         // If the fallback hasn't been previously initialized then let's spin

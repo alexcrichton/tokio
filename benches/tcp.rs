@@ -1,152 +1,108 @@
-#![feature(test)]
+#![feature(test, conservative_impl_trait)]
 
 extern crate futures;
 extern crate tokio;
-
 #[macro_use]
 extern crate tokio_io;
+extern crate test;
 
-pub extern crate test;
+use std::time::Duration;
 
-mod prelude {
-    pub use futures::*;
-    pub use tokio::reactor::Reactor;
-    pub use tokio::net::{TcpListener, TcpStream};
-    pub use tokio_io::io::read_to_end;
+use tokio::net::TcpStream;
 
-    pub use test::{self, Bencher};
-    pub use std::thread;
-    pub use std::time::Duration;
-    pub use std::io::{self, Read, Write};
+fn unlinger(s: &TcpStream) {
+    s.set_linger(Some(Duration::from_secs(0))).unwrap();
 }
 
 mod connect_churn {
-    use ::prelude::*;
+    use std::io;
+    use std::thread;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Barrier};
+
+    use futures::prelude::*;
+    use futures::stream;
+    use futures::sync::oneshot;
+    use test::Bencher;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_io::io::read_to_end;
+
+    use super::unlinger;
 
     const NUM: usize = 300;
     const CONCURRENT: usize = 8;
 
-    #[bench]
-    fn one_thread(b: &mut Bencher) {
-        let addr = "127.0.0.1:0".parse().unwrap();
-        let mut core = Reactor::new().unwrap();
-        let handle = core.handle();
-        let listener = TcpListener::bind(&addr, &handle).unwrap();
+    fn n_workers(n: usize, b: &mut Bencher) {
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let listener = TcpListener::bind(&"127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = listener.local_addr().unwrap();
 
-        // Spawn a single task that accepts & drops connections
-        handle.spawn(
+        let listener_thread = thread::spawn(move || {
             listener.incoming()
                 .map_err(|e| panic!("server err: {:?}", e))
-                .for_each(|_| Ok(())));
-
-        b.iter(move || {
-            let connects = stream::iter((0..NUM).map(|_| {
-                Ok(TcpStream::connect(&addr, &handle)
-                    .and_then(|sock| {
-                        sock.set_linger(Some(Duration::from_secs(0))).unwrap();
-                        read_to_end(sock, vec![])
-                    }))
-            }));
-
-            core.run(
-                connects.buffer_unordered(CONCURRENT)
-                    .map_err(|e| panic!("client err: {:?}", e))
-                    .for_each(|_| Ok(()))).unwrap();
-        });
-    }
-
-    fn n_workers(n: usize, b: &mut Bencher) {
-        let (shutdown_tx, shutdown_rx) = sync::oneshot::channel();
-        let (remote_tx, remote_rx) = ::std::sync::mpsc::channel();
-
-        // Spawn reactor thread
-        thread::spawn(move || {
-            // Create the core
-            let mut core = Reactor::new().unwrap();
-
-            // Reactor handles
-            let handle = core.handle();
-            let remote = handle.remote().clone();
-
-            // Bind the TCP listener
-            let listener = TcpListener::bind(
-                &"127.0.0.1:0".parse().unwrap(), &handle).unwrap();
-
-            // Get the address being listened on.
-            let addr = listener.local_addr().unwrap();
-
-            // Send the remote & address back to the main thread
-            remote_tx.send((remote, addr)).unwrap();
-
-            // Spawn a single task that accepts & drops connections
-            handle.spawn(
-                listener.incoming()
-                    .map_err(|e| panic!("server err: {:?}", e))
-                    .for_each(|_| Ok(())));
-
-            // Run the reactor
-            core.run(shutdown_rx).unwrap();
+                .for_each(|(s, _)| {
+                    unlinger(&s);
+                    Ok(())
+                })
+                .select(shutdown_rx)
+                .wait()
+                .ok()
+                .unwrap()
         });
 
-        // Get the remote info
-        let (remote, addr) = remote_rx.recv().unwrap();
-
-        b.iter(move || {
-            use std::sync::{Barrier, Arc};
-
-            // Create a barrier to coordinate threads
-            let barrier = Arc::new(Barrier::new(n + 1));
-
-            // Spawn worker threads
-            let threads: Vec<_> = (0..n).map(|_| {
-                let barrier = barrier.clone();
-                let remote = remote.clone();
-                let addr = addr.clone();
-
-                thread::spawn(move || {
-                    let connects = stream::iter((0..(NUM / n)).map(|_| {
-                        // TODO: Once `Handle` is `Send / Sync`, update this
-
-                        let (socket_tx, socket_rx) = sync::oneshot::channel();
-
-                        remote.spawn(move |handle| {
-                            TcpStream::connect(&addr, &handle)
-                                .map_err(|e| panic!("connect err: {:?}", e))
-                                .then(|res| socket_tx.send(res))
-                                .map_err(|_| ())
-                        });
-
-                        Ok(socket_rx
-                            .then(|res| res.unwrap())
-                            .and_then(|sock| {
-                                sock.set_linger(Some(Duration::from_secs(0))).unwrap();
-                                read_to_end(sock, vec![])
-                            }))
+        let barrier = Arc::new(Barrier::new(n + 1));
+        let workers = (0..n).map(|_| {
+            let barrier = barrier.clone();
+            let (tx, rx) = mpsc::channel();
+            let thread = thread::spawn(move || {
+                for () in rx {
+                    let connects = stream::iter_ok((0..(NUM / n)).map(|_| {
+                        let tcp = TcpStream::connect(&addr);
+                        Ok(tcp.and_then(|sock| {
+                            unlinger(&sock);
+                            read_to_end(sock, vec![])
+                        }))
                     }));
 
-                    barrier.wait();
-
                     connects.buffer_unordered(CONCURRENT)
-                        .map_err(|e| panic!("client err: {:?}", e))
-                        .for_each(|_| Ok(())).wait().unwrap();
-                })
-            }).collect();
+                        .map_err(|e: io::Error| panic!("client err: {:?}", e))
+                        .for_each(|_| Ok(()))
+                        .wait()
+                        .unwrap();
+
+                    barrier.wait();
+                }
+            });
+            (thread, tx)
+        }).collect::<Vec<_>>();
+
+        b.iter(|| {
+            // signal that everyone should start connecting, then wait for
+            // everyone to be done on the barrier.
+            for &(_, ref tx) in workers.iter() {
+                tx.send(()).unwrap();
+            }
 
             barrier.wait();
-
-            for th in threads {
-                th.join().unwrap();
-            }
         });
 
-        // Shutdown the reactor
+        for (thread, tx) in workers {
+            drop(tx);
+            thread.join().unwrap();
+        }
+
         shutdown_tx.send(()).unwrap();
+        listener_thread.join().unwrap();
+    }
+
+    #[bench]
+    fn one_thread(b: &mut Bencher) {
+        n_workers(1, b);
     }
 
     #[bench]
     fn two_threads(b: &mut Bencher) {
-        n_workers(1, b);
+        n_workers(2, b);
     }
 
     #[bench]
@@ -156,14 +112,24 @@ mod connect_churn {
 }
 
 mod transfer {
-    use ::prelude::*;
-    use std::{cmp, mem};
+    use std::cmp;
+    use std::io::{self, Read, Write};
+    use std::sync::mpsc;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    use futures::prelude::*;
+    use test::Bencher;
+    use tokio::net::{TcpListener, TcpStream};
+
+    use super::unlinger;
 
     const MB: usize = 3 * 1024 * 1024;
 
     struct Drain {
         sock: TcpStream,
-        chunk: usize,
+        rem: usize,
+        chunk: Box<[u8]>,
     }
 
     impl Future for Drain {
@@ -171,21 +137,21 @@ mod transfer {
         type Error = io::Error;
 
         fn poll(&mut self) -> Poll<(), io::Error> {
-            let mut buf: [u8; 1024] = unsafe { mem::uninitialized() };
-
-            loop {
-                match try_nb!(self.sock.read(&mut buf[..self.chunk])) {
-                    0 => return Ok(Async::Ready(())),
-                    _ => {}
+            while self.rem > 0 {
+                match try_nb!(self.sock.read(&mut self.chunk)) {
+                    0 => panic!("hit eof"),
+                    n => self.rem -= n,
                 }
             }
+
+            Ok(Async::Ready(()))
         }
     }
 
     struct Transfer {
         sock: TcpStream,
         rem: usize,
-        chunk: usize,
+        chunk: &'static [u8],
     }
 
     impl Future for Transfer {
@@ -194,8 +160,8 @@ mod transfer {
 
         fn poll(&mut self) -> Poll<(), io::Error> {
             while self.rem > 0 {
-                let len = cmp::min(self.rem, self.chunk);
-                let buf = &DATA[..len];
+                let len = cmp::min(self.rem, self.chunk.len());
+                let buf = &self.chunk[..len];
 
                 let n = try_nb!(self.sock.write(&buf));
                 self.rem -= n;
@@ -208,123 +174,83 @@ mod transfer {
     static DATA: [u8; 1024] = [0; 1024];
 
     fn one_thread(b: &mut Bencher, read_size: usize, write_size: usize) {
-        let addr = "127.0.0.1:0".parse().unwrap();
-        let mut core = Reactor::new().unwrap();
-        let handle = core.handle();
-        let listener = TcpListener::bind(&addr, &handle).unwrap();
+        let listener = TcpListener::bind(&"127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = listener.local_addr().unwrap();
+        let sock1 = TcpStream::connect(&addr).wait().unwrap();
+        let sock2 = listener.incoming().into_future().wait().ok().unwrap().0.unwrap().0;
+        unlinger(&sock1);
+        unlinger(&sock2);
 
-        let h2 = handle.clone();
+        let mut read = Drain {
+            sock: sock1,
+            rem: MB,
+            chunk: vec![0; read_size].into_boxed_slice(),
+        };
+        let mut write = Transfer {
+            sock: sock2,
+            rem: MB,
+            chunk: &DATA[..write_size],
+        };
 
-        // Spawn a single task that accepts & drops connections
-        handle.spawn(
-            listener.incoming()
-                .map_err(|e| panic!("server err: {:?}", e))
-                .for_each(move |(sock, _)| {
-                    sock.set_linger(Some(Duration::from_secs(0))).unwrap();
-                    let drain = Drain {
-                        sock: sock,
-                        chunk: read_size,
-                    };
-
-                    h2.spawn(drain.map_err(|e| panic!("server error: {:?}", e)));
-
-                    Ok(())
-                }));
-
-        b.iter(move || {
-            let client = TcpStream::connect(&addr, &handle)
-                .and_then(|sock| {
-                    Transfer {
-                        sock: sock,
-                        rem: MB,
-                        chunk: write_size,
-                    }
-                });
-
-            core.run(
-                client.map_err(|e| panic!("client err: {:?}", e))
-                ).unwrap();
+        b.iter(|| {
+            write.rem = MB;
+            read.rem = MB;
+            (&mut read).join(&mut write).wait().unwrap();
         });
     }
 
-    fn cross_thread(b: &mut Bencher, read_size: usize, write_size: usize) {
-        let (shutdown_tx, shutdown_rx) = sync::oneshot::channel();
-        let (remote_tx, remote_rx) = ::std::sync::mpsc::channel();
+    fn two_threads(b: &mut Bencher, read_size: usize, write_size: usize) {
+        let listener = TcpListener::bind(&"127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sock1 = TcpStream::connect(&addr).wait().unwrap();
+        let sock2 = listener.incoming().into_future().wait().ok().unwrap().0.unwrap().0;
+        unlinger(&sock1);
+        unlinger(&sock2);
 
-        // Spawn reactor thread
-        thread::spawn(move || {
-            // Create the core
-            let mut core = Reactor::new().unwrap();
+        let mut read = Drain {
+            sock: sock1,
+            rem: MB,
+            chunk: vec![0; read_size].into_boxed_slice(),
+        };
+        let mut write = Transfer {
+            sock: sock2,
+            rem: MB,
+            chunk: &DATA[..write_size],
+        };
 
-            // Reactor handles
-            let handle = core.handle();
-            let remote = handle.remote().clone();
-
-            remote_tx.send(remote).unwrap();
-            core.run(shutdown_rx).unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let (tx1, rx1) = mpsc::channel();
+        let (tx2, rx2) = mpsc::channel();
+        let barrier2 = barrier.clone();
+        let t1 = thread::spawn(move || {
+            for () in rx1 {
+                write.rem = MB;
+                (&mut write).wait().unwrap();
+                barrier2.wait();
+            }
+        });
+        let barrier2 = barrier.clone();
+        let t2 = thread::spawn(move || {
+            for () in rx2 {
+                read.rem = MB;
+                (&mut read).wait().unwrap();
+                barrier2.wait();
+            }
         });
 
-        let remote = remote_rx.recv().unwrap();
-
-        b.iter(move || {
-            let (server_tx, server_rx) = sync::oneshot::channel();
-            let (client_tx, client_rx) = sync::oneshot::channel();
-
-            remote.spawn(|handle| {
-                let sock = TcpListener::bind(&"127.0.0.1:0".parse().unwrap(), &handle).unwrap();
-                server_tx.send(sock).unwrap();
-                Ok(())
-            });
-
-            let remote2 = remote.clone();
-
-            server_rx.and_then(move |server| {
-                let addr = server.local_addr().unwrap();
-
-                remote2.spawn(move |handle| {
-                    let fut = TcpStream::connect(&addr, &handle);
-                    client_tx.send(fut).ok().unwrap();
-                    Ok(())
-                });
-
-                let client = client_rx
-                    .then(|res| res.unwrap())
-                    .and_then(move |sock| {
-                        Transfer {
-                            sock: sock,
-                            rem: MB,
-                            chunk: write_size,
-                        }
-                    });
-
-                let server = server.incoming().into_future()
-                    .map_err(|(e, _)| e)
-                    .and_then(move |(sock, _)| {
-                        let sock = sock.unwrap().0;
-                        sock.set_linger(Some(Duration::from_secs(0))).unwrap();
-
-                        Drain {
-                            sock: sock,
-                            chunk: read_size,
-                        }
-                    });
-
-                client
-                    .join(server)
-                    .then(|res| {
-                        let _ = res.unwrap();
-                        Ok(())
-                    })
-            }).wait().unwrap();
+        b.iter(|| {
+            tx1.send(()).unwrap();
+            tx2.send(()).unwrap();
+            barrier.wait();
         });
 
-        // Shutdown the reactor
-        shutdown_tx.send(()).unwrap();
+        drop((tx1, tx2));
+        t1.join().unwrap();
+        t2.join().unwrap();
     }
 
     mod small_chunks {
-        use ::prelude::*;
+        use test::Bencher;
 
         #[bench]
         fn one_thread(b: &mut Bencher) {
@@ -332,13 +258,13 @@ mod transfer {
         }
 
         #[bench]
-        fn cross_thread(b: &mut Bencher) {
-            super::cross_thread(b, 32, 32);
+        fn two_threads(b: &mut Bencher) {
+            super::two_threads(b, 32, 32);
         }
     }
 
     mod big_chunks {
-        use ::prelude::*;
+        use test::Bencher;
 
         #[bench]
         fn one_thread(b: &mut Bencher) {
@@ -346,8 +272,8 @@ mod transfer {
         }
 
         #[bench]
-        fn cross_thread(b: &mut Bencher) {
-            super::cross_thread(b, 1_024, 1_024);
+        fn two_threads(b: &mut Bencher) {
+            super::two_threads(b, 1_024, 1_024);
         }
     }
 }
